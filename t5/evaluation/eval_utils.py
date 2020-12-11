@@ -405,3 +405,159 @@ def run_eval(
         raise ValueError("{} padded outputs, {} expected.".format(
             len(outputs), expected_pad))
 
+
+class Evaluator:
+  """A class to encapsulate all eval-related information.
+
+  Users should define `predict_fn` and then instantiate an Evaluator object. The
+  evaluation data is cached once and will be used for arbitrary number of
+  evaluation runs.
+
+  Attributes:
+    eval_tasks: a mapping from task name to t5.data.Task object
+    predict_fn: a callable which maps the dataset to predictions.
+    cached_ds: cached evaluation datasets
+    cached_examples: cached evaluation examples.
+    cached_targets: cached evaluation examples.
+  """
+
+  def __init__(self,
+               mixture_or_task_name: str,
+               predict_fn,
+               feature_converter: t5.data.FeatureConverter,
+               eval_split: str = "validation",
+               use_cached: bool = False,
+               max_eval_lengths: Mapping[str, int] = None):
+    """Evaluator constructor.
+
+    Args:
+      mixture_or_task_name: a registered task or mixture name.
+      predict_fn: a user-defined function, which takes in a tf.data.Dataset and
+        outputs decoded predictions.
+      feature_converter: a feature converter object to use to convert the task
+        features to model features. Must be a subclass of
+        t5.data.FeatureConverter.
+      eval_split: evaluation split. Typically "validation" or "test".
+      use_cached: whether to use the cached dataset instead of processing it on
+        the fly.
+      max_eval_lengths: an optional length specification. If specified, these
+        will be the hard-limit on the evaluation data used for prediction. If
+        unspecified, the maximum length for each feature will be used. These
+        lengths are  computed while caching the datasets.
+    """
+    self._predict_fn = predict_fn
+    eval_mixture_or_task = t5.data.get_mixture_or_task(mixture_or_task_name)
+    if isinstance(eval_mixture_or_task, t5.data.Mixture):
+      eval_tasks = eval_mixture_or_task.tasks
+    elif isinstance(eval_mixture_or_task, t5.data.TaskV3):
+      eval_tasks = [eval_mixture_or_task]
+    else:
+      raise ValueError(
+          "eval_mixture_or_task should be an instance of either t5.data.Mixture"
+          " or t5.data.Task.")
+
+    # Combine these two loops
+    for task in eval_tasks:
+      if eval_split not in task.splits:
+        logging.info('Task %s has no "%s" split; skipping eval.', task.name,
+                     eval_split)
+    self._eval_tasks = [
+        task for task in eval_tasks
+        if eval_split in task.splits and task.metric_fns
+    ]
+
+    def dataset_fn(task: t5.data.TaskV3) -> tf.data.Dataset:
+      return task.get_dataset(
+          sequence_length=None,
+          split=eval_split,
+          shuffle=False,
+          use_cached=use_cached)
+
+    # Since we are resuing this, we may as well cache the target.
+    cached_examples, cached_targets, task_datasets, actual_max_lengths = \
+        model_utils.get_targets_and_examples(
+            tasks=self._eval_tasks,
+            dataset_fn=dataset_fn)
+
+    if max_eval_lengths is None:
+      logging.info("Setting sequence lengths to %s", actual_max_lengths)
+      lengths = actual_max_lengths
+    elif (max_eval_lengths["inputs"] < actual_max_lengths["inputs"] or
+          max_eval_lengths["targets"] < actual_max_lengths["targets"]):
+      logging.warning(
+          "Given sequence lengths are insufficient for some evaluation inputs "
+          "or targets. These sequences will be truncated to fit, likely "
+          "leading to sub-optimal results. Consider passing `None` for "
+          "max_eval_lengths to have them be automatically computed.\n Got: %s, "
+          "\n Max Lengths:%s", max_eval_lengths, actual_max_lengths)
+      lengths = max_eval_lengths
+    elif (max_eval_lengths["inputs"] > actual_max_lengths["inputs"] or
+          max_eval_lengths["targets"] > actual_max_lengths["targets"]):
+      logging.warning(
+          "Given sequence lengths are longer than necessary for some "
+          "evaluation inputs or targets, resulting in wasted computation. "
+          "Consider passing `None` for max_eval_lengths to have them be "
+          "automatically computed.\n Got: %s,\n Max Lengths: %s",
+          max_eval_lengths, actual_max_lengths)
+      lengths = max_eval_lengths
+
+    self._cached_ds = {}
+    # Convert the task features to model features
+    for task in self._eval_tasks:
+      eval_ds = feature_converter(task_datasets[task.name], lengths)
+
+      # Instead of caching a list of examples, we can cache in the form of
+      # tf.data.Dataset Note that each worker cache the whole dataset because
+      # how the dataset will be sharded is not known here.
+      self._cached_ds[task.name] = eval_ds.cache()
+
+    self._cached_examples = cached_examples
+    self._cached_targets = cached_targets
+
+  def evaluate(self, compute_metrics: bool, *args):
+    """Predict and optionally compute metrics of self.eval.tasks."""
+
+    # Prediction is done on hosts
+    all_outputs = {}
+    for task in self.eval_tasks:
+      all_outputs[task.name] = self.predict_fn(self.cached_ds[task.name], *args)
+
+    # Computing metrics is only done in one host.
+    if compute_metrics:
+      all_metrics = {}
+      for task in self.eval_tasks:
+        metrics = []
+        task_examples = self.cached_examples[task.name]
+        for metric_fn in task.metric_fns:
+          targets = self.cached_targets[task.name]
+          predictions = [
+              task.postprocess_fn(  # pylint:disable=g-complex-comprehension
+                  d,
+                  example=ex,
+                  is_target=False)
+              for d, ex in zip(all_outputs[task.name], task_examples)
+          ]
+          metrics.append(metric_fn(targets, predictions))
+        all_metrics[task.name] = metrics
+
+      return all_metrics
+
+  @property
+  def eval_tasks(self) -> Sequence[t5.data.TaskV3]:
+    return self._eval_tasks
+
+  @property
+  def predict_fn(self):
+    return self._predict_fn
+
+  @property
+  def cached_ds(self) -> Mapping[str, tf.data.Dataset]:
+    return self._cached_ds
+
+  @property
+  def cached_examples(self):
+    return self._cached_examples
+
+  @property
+  def cached_targets(self) -> Mapping[str, Sequence[str]]:
+    return self._cached_targets
